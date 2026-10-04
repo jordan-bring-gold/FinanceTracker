@@ -1,0 +1,10 @@
+# Never commit financial data, even if some ends up in this folder by mistake.
+*.csv
+*.tsv
+finance-tracker.json
+.finance-tracker-backups/
+
+# Claude Code setup for this machine: rules, hooks, test data and scratch files. They contain local paths and stay
+# on disk only, so the guard hook keeps working here.
+.claude/
+CLAUDE.md
