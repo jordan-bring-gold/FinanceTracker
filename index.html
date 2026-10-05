@@ -284,6 +284,7 @@ table.data td.chk, table.data th.chk { width: 34px; padding-right: 0; }
 table.data.compact td { padding: 6px 10px; }
 table.data.compact th { padding: 7px 10px; }
 table.data tr.bad td { background: var(--danger-soft); }
+table.data tr.hl td { background: var(--accent-soft); }
 table.data th.newcol { color: var(--accent-text); box-shadow: inset 0 -2px 0 var(--accent); }
 table.data td.newcol { background: var(--accent-soft); }
 table.data td.cell-err { color: var(--expense-text); }
@@ -831,6 +832,21 @@ function matchVendorRule(rules, row) {
   return -1;
 }
 
+/**
+ * Pass rules let rows through unchanged: a row no vendor rule matched passes when its Description column contains
+ * the rule's text and its Category column contains the rule's category (empty = any), ignoring case. Its vendor
+ * comes from the fallback vendor column and its category stays the one in the file.
+ */
+const passReady = r => r.enabled !== false && String(r.description ?? '').trim() !== '';
+function matchPassRule(rules, m, row) {
+  const cell = c => c ? String(row[c] ?? '') : '';
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i];
+    if (passReady(r) && testOp(cell(m.description), 'contains', String(r.description).trim(), false) && testOp(cell(m.category), 'contains', String(r.category ?? '').trim(), false)) return i;
+  }
+  return -1;
+}
+
 /** Skip rules can test a CSV column or the vendor name the vendor rules produced. */
 const VENDOR_FIELD = '__vendor__';
 const skipReady = r => r.enabled !== false && r.column && String(r.value ?? '').trim();
@@ -847,7 +863,7 @@ function matchSkipRule(rules, row, vendor) {
 
 /**
  * Turn parsed CSV rows into standardized records using the template's column mapping and vendor rules.
- * Each record keeps its raw row and the index of the vendor rule that matched (-1 = unmatched).
+ * Each record keeps its raw row and the index of the vendor rule or pass rule that matched (-1 = none).
  */
 function buildRecords(tpl, table) {
   const m = tpl.mapping || {}, rules = tpl.vendorRules || [], fmt = tpl.dateFormat || 'auto';
@@ -868,15 +884,16 @@ function buildRecords(tpl, table) {
     }
     if (tpl.skipZero && amount === 0) return;
     const rule = matchVendorRule(rules, row);
+    const pass = rule < 0 ? matchPassRule(tpl.passRules || [], m, row) : -1;
     const vendor = rule >= 0 ? String(rules[rule].vendor).trim() : (get(m.vendor) || get(m.description));
     const errors = [];
     if (!m.date) errors.push('No date column mapped'); else if (!date) errors.push(`Invalid date "${rawDate}"`);
     const amtMapped = tpl.amountMode === 'debitCredit' ? (m.debit || m.credit) : m.amount;
     if (!amtMapped) errors.push('No amount column mapped'); else if (amount == null) errors.push(`Invalid amount "${rawAmt}"`);
     if (!vendor) errors.push('No vendor');
-    const ruleCategory = rule >= 0 ? String(rules[rule].category ?? '').trim() : '';
+    const ruleCategory = rule >= 0 ? String(rules[rule].category ?? '').trim() : pass >= 0 ? get(m.category) : '';
     const skip = matchSkipRule(tpl.skipRules || [], row, vendor);
-    out.push({ row: i + 1, raw: row, rule, skip, date: date || '', vendor, vendorId: get(m.vendorId), description: get(m.description), amount, category: get(m.category), ruleCategory, errors });
+    out.push({ row: i + 1, raw: row, rule, pass, skip, date: date || '', vendor, vendorId: get(m.vendorId), description: get(m.description), amount, category: get(m.category), ruleCategory, errors });
   });
   return out;
 }
@@ -885,8 +902,8 @@ function prepareImport(tpl, table) {
   const recs = buildRecords(tpl, table);
   const kept = recs.filter(r => r.skip < 0);
   const skippedByRule = recs.length - kept.length;
-  const unmatched = kept.filter(r => r.rule < 0).length;
-  const usable = kept.filter(r => !(tpl.unmatched === 'skip' && r.rule < 0));
+  const unmatched = kept.filter(r => r.rule < 0 && r.pass < 0).length;
+  const usable = kept.filter(r => !(tpl.unmatched === 'skip' && r.rule < 0 && r.pass < 0));
   const skipped = skippedByRule + (tpl.unmatched === 'skip' ? unmatched : 0);
   return { records: usable.filter(r => !r.errors.length), invalid: usable.filter(r => r.errors.length).length, skipped, skippedByRule, unmatched };
 }
@@ -1976,9 +1993,9 @@ document.addEventListener('keydown', e => {
    select's value and fires 'input' and 'change' just like a real pick. Hidden options show as the current value but
    aren't listed (the top bar uses this for a month picked on the page). */
 const DD = { sel: null, menu: null };
-function enhanceSelect(sel) {
+/** Width is passed in so a batch of selects can be measured in one layout (see the observer below). */
+function enhanceSelect(sel, width = sel.offsetWidth) {
   if (sel._dd || sel.multiple) return;
-  const width = sel.offsetWidth;
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = sel.className + ' dd-btn';
@@ -2048,11 +2065,16 @@ window.addEventListener('scroll', e => { if (DD.menu && !DD.menu.contains(e.targ
 window.addEventListener('resize', () => closeDropdown());
 new MutationObserver(muts => {
   if (DD.sel && !DD.sel.isConnected) closeDropdown();
+  const sels = [];
   for (const m of muts) for (const n of m.addedNodes) {
     if (n.nodeType !== 1) continue;
-    if (n.matches('select.select')) enhanceSelect(n);
-    else if (n.firstElementChild) n.querySelectorAll('select.select').forEach(enhanceSelect);
+    if (n.matches('select.select')) sels.push(n);
+    else if (n.firstElementChild) sels.push(...n.querySelectorAll('select.select'));
   }
+  // Read every width before changing anything: measuring between inserts re-lays out the page once per select,
+  // which takes seconds on a page with hundreds of them (e.g. a template with many rules).
+  const todo = sels.filter(s => !s._dd && !s.multiple), widths = todo.map(s => s.offsetWidth);
+  todo.forEach((s, i) => enhanceSelect(s, widths[i]));
 }).observe(document.body, { childList: true, subtree: true });
 
 /* ---------- sortable tables ----------
@@ -3730,7 +3752,7 @@ function newTemplate(folder) {
     id: uid(), name: folder ? prettyName(folder) : '', folder: folder || '',
     parse: { delimiter: 'auto', hasHeader: true, skipRows: 0, skipFooter: 0 },
     parent: '', mapping: {}, dateFormat: 'auto', amountMode: 'single', flipSign: false,
-    vendorRules: [], skipRules: [], unmatched: 'import', skipZero: true, enabled: true, _new: true,
+    vendorRules: [], passRules: [], skipRules: [], unmatched: 'import', skipZero: true, enabled: true, _new: true,
   };
 }
 function openEditor(tpl, presetFolder) {
@@ -3842,30 +3864,46 @@ async function renderEditor(root) {
         </div></div></div>
       <div class="card"><div class="card-head"><div><div class="card-title">Vendor rules</div><div class="card-sub">Checked top to bottom; the first match sets the vendor. Matching ignores upper/lower case.</div></div>
           <div class="card-actions"><button class="btn primary sm" id="edAddRule">${icon('plus')}Add rule</button></div></div>
-        <div class="card-body">${categoryDatalist()}<div class="vrules" id="edRules">${d.vendorRules.map((r, i) => ruleRow(r, i, cols)).join('') || `<div class="hint" style="padding:4px 2px">No vendor rules yet. Click <b>+ Rule</b> on a row in the Unmatched table below, or use <b>Add rule</b>.<br>Tip: highlight part of a cell first (like <span class="mono">COSTCO</span>) and that text becomes the match.</div>`}</div></div>
+        <div class="card-body">${categoryDatalist()}<div class="vrules" id="edRules">${d.vendorRules.map((r, i) => ruleRow(r, i, cols)).join('') || RULES_EMPTY.rule}</div></div>
         <div id="edStats"></div>
+      </div>
+      <div class="card"><div class="card-head"><div><div class="card-title">Pass rules</div><div class="card-sub">Rows no vendor rule matched, whose Description and Category contain this text, are imported as they are in the file. Leave the category empty to match any. Matching ignores upper/lower case.</div></div></div>
+        <div class="card-body"><div class="vrules" id="edPassRules">${d.passRules.map((r, i) => passRow(r, i)).join('') || RULES_EMPTY.pass}</div></div>
       </div>
       <div class="card"><div class="card-head"><div><div class="card-title">Skip rules</div><div class="card-sub">Rows that match any of these are not imported. Checked after vendor rules, so you can skip by vendor name.</div></div>
           <div class="card-actions"><button class="btn sm" id="edAddSkip">${icon('plus')}Add skip rule</button></div></div>
-        <div class="card-body"><div class="vrules" id="edSkipRules">${d.skipRules.map((r, i) => skipRow(r, i, cols)).join('') || `<div class="hint" style="padding:4px 2px">No skip rules. Click <b>Skip</b> on a row below to start one, or use <b>Add skip rule</b>.</div>`}</div></div>
+        <div class="card-body"><div class="vrules" id="edSkipRules">${d.skipRules.map((r, i) => skipRow(r, i, cols)).join('') || RULES_EMPTY.skip}</div></div>
       </div>
     </div>
     <div class="card"><div class="card-head"><div><div class="card-title" id="edUnTitle">Unmatched rows</div><div class="card-sub" id="edUnSub"></div></div></div><div class="card-body flush" id="edUnmatchedTbl"></div></div>
-    <div class="card"><div class="card-head"><div><div class="card-title" id="edMaTitle">Matched rows</div><div class="card-sub">Formatted exactly as they will be imported</div></div></div><div class="card-body flush" id="edMatchedTbl"></div></div>
+    <div class="card"><div class="card-head"><div><div class="card-title" id="edMaTitle">Matched rows</div><div class="card-sub" id="edMaSub">Formatted exactly as they will be imported</div></div></div><div class="card-body flush" id="edMatchedTbl"></div></div>
     <div class="card"><div class="card-head"><div><div class="card-title" id="edSkTitle">Skipped rows</div><div class="card-sub">Left out by a skip rule. These will not be imported.</div></div></div><div class="card-body flush" id="edSkippedTbl"></div></div>`;
   drawEditorTables();
   bindEditor(root);
 }
 
+const RULES_EMPTY = {
+  rule: `<div class="hint" style="padding:4px 2px">No vendor rules yet. Click <b>+ Rule</b> on a row in the Unmatched table below, or use <b>Add rule</b>.<br>Tip: highlight part of a cell first (like <span class="mono">COSTCO</span>) and that text becomes the match.</div>`,
+  pass: `<div class="hint" style="padding:4px 2px">No pass rules. Click <b>Pass</b> on a row in the Unmatched table below to let rows with that description and category through.<br>Tip: highlight part of the description first (like <span class="mono">AMAZON</span>) and that text becomes the match.</div>`,
+  skip: `<div class="hint" style="padding:4px 2px">No skip rules. Click <b>Skip</b> on a row below to start one, or use <b>Add skip rule</b>.</div>`,
+};
+/** Count badge for a vendor rule (key 'rule') or pass rule (key 'pass'): rows it caught, and how many of those a skip rule then leaves out. */
+function catchBadge(key, r, i) {
+  if (!(key === 'pass' ? passReady(r) : ruleReady(r))) return { cls: '', text: 'incomplete' };
+  let n = 0, sk = 0;
+  for (const x of S.ui.editor.recs) if (x[key] === i) { n++; if (x.skip >= 0) sk++; }
+  return { cls: n ? 'green' : 'amber', text: `${n} row${n === 1 ? '' : 's'}${sk ? ` · ${sk} skipped` : ''}` };
+}
+const CATCH_TITLE = 'Rows this rule caught. Any marked skipped are then left out by a skip rule.';
 function ruleRow(r, i, cols) {
-  const n = S.ui.editor.recs.filter(x => x.rule === i).length;
+  const b = catchBadge('rule', r, i);
   return `<div class="vrule ${r.enabled === false ? 'off' : ''}" data-rule="${i}">
     <span class="step-num">${i + 1}</span>
     <span class="vr-word">If</span>
     <select class="select sm" data-rf="column" title="CSV column">${colOptions(cols, r.column, 'Column…')}</select>
     <select class="select sm" data-rf="op">${VENDOR_OPS.map(([k, l]) => `<option value="${k}" ${(r.op || 'contains') === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
     <input class="input sm" data-rf="value" value="${esc(r.value ?? '')}" placeholder="text to find">
-    <span class="vr-end"><span class="badge vr-count ${ruleReady(r) ? (n ? 'green' : 'amber') : ''}" title="Rows this rule matched">${ruleReady(r) ? `${n} row${n === 1 ? '' : 's'}` : 'incomplete'}</span>
+    <span class="vr-end"><span class="badge vr-count ${b.cls}" title="${CATCH_TITLE}">${b.text}</span>
     <span class="vr-tools">
       <button class="btn ghost icon sm" data-ract="up" title="Move up" ${i === 0 ? 'disabled' : ''}>${icon('up')}</button>
       <button class="btn ghost icon sm" data-ract="down" title="Move down" ${i === S.ui.editor.draft.vendorRules.length - 1 ? 'disabled' : ''}>${icon('down')}</button>
@@ -3895,6 +3933,21 @@ function skipRow(r, i, cols) {
     </span></span>
   </div>`;
 }
+function passRow(r, i) {
+  const b = catchBadge('pass', r, i);
+  return `<div class="vrule prule ${r.enabled === false ? 'off' : ''}" data-pass="${i}">
+    <span class="step-num">${i + 1}</span>
+    <span class="vr-word">If description contains</span>
+    <input class="input sm" data-pf="description" value="${esc(r.description ?? '')}" placeholder="text to find">
+    <span class="vr-word">and category contains</span>
+    <input class="input sm" data-pf="category" value="${esc(r.category ?? '')}" placeholder="any category">
+    <span class="vr-end"><span class="vr-word">→ pass</span><span class="badge pr-count ${b.cls}" title="${CATCH_TITLE}">${b.text}</span>
+    <span class="vr-tools">
+      <button class="btn ghost icon sm" data-pact="toggle" title="${r.enabled === false ? 'Enable' : 'Disable'}">${icon(r.enabled === false ? 'eyeoff' : 'eye')}</button>
+      <button class="btn ghost icon sm danger" data-pact="del" title="Delete pass rule">${icon('trash')}</button>
+    </span></span>
+  </div>`;
+}
 function tableHtml(columns, rows, { limit = 150, rowNums = true } = {}) {
   if (!columns.length) return `<div class="empty" style="padding:28px"><p>No data.</p></div>`;
   return `<div class="table-wrap" style="max-height:340px"><table class="data compact"><thead><tr>${rowNums ? '<th class="rownum">#</th>' : ''}${columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>
@@ -3911,16 +3964,20 @@ function drawEditorTables() {
   }
   const cols = ed.raw.columns;
   const skippedRows = ed.recs.filter(r => r.skip >= 0), recs = ed.recs.filter(r => r.skip < 0);
-  const matched = recs.filter(r => r.rule >= 0), unmatched = recs.filter(r => r.rule < 0);
+  let matched = recs.filter(r => r.rule >= 0 || r.pass >= 0);
+  const unmatched = recs.filter(r => r.rule < 0 && r.pass < 0);
   const willImport = d.unmatched === 'skip' ? matched : recs;
   const good = willImport.filter(r => !r.errors.length), bad = willImport.filter(r => r.errors.length);
   const inc = sum(good.filter(r => r.amount > 0), r => r.amount), exp = sum(good.filter(r => r.amount < 0), r => r.amount);
   $('#edStats').innerHTML = `<div class="stat-strip" style="border-top:1px solid var(--border)"><span>Rows<b>${ed.recs.length}</b></span><span>Skipped<b>${skippedRows.length}</b></span><span>Matched<b class="${matched.length ? 'pos' : ''}">${matched.length}</b></span><span>Unmatched<b>${unmatched.length}</b></span><span>Invalid<b class="${bad.length ? 'neg' : ''}">${bad.length}</b></span><span>Will import<b>${good.length}</b></span><span>In<b class="pos">${money(inc)}</b></span><span>Out<b>${money(exp)}</b></span></div>`;
   // Rule badges
   $$('#edRules .vrule').forEach(row => {
-    const i = +row.dataset.rule, r = d.vendorRules[i], n = ed.recs.filter(x => x.rule === i).length, b = $('.vr-count', row);
-    b.className = `badge vr-count ${ruleReady(r) ? (n ? 'green' : 'amber') : ''}`;
-    b.textContent = ruleReady(r) ? `${n} row${n === 1 ? '' : 's'}` : 'incomplete';
+    const b = catchBadge('rule', d.vendorRules[+row.dataset.rule], +row.dataset.rule), el = $('.vr-count', row);
+    el.className = `badge vr-count ${b.cls}`; el.textContent = b.text;
+  });
+  $$('#edPassRules .prule').forEach(row => {
+    const b = catchBadge('pass', d.passRules[+row.dataset.pass], +row.dataset.pass), el = $('.pr-count', row);
+    el.className = `badge pr-count ${b.cls}`; el.textContent = b.text;
   });
   $$('#edSkipRules .srule').forEach(row => {
     const i = +row.dataset.skip, r = d.skipRules[i], n = ed.recs.filter(x => x.skip === i).length, b = $('.sr-count', row);
@@ -3930,23 +3987,29 @@ function drawEditorTables() {
   // Unmatched: raw CSV rows, each with a quick "+ Rule" button
   $('#edUnTitle').innerHTML = `Unmatched rows <span class="badge ${unmatched.length ? 'amber' : 'green'}">${unmatched.length}</span>`;
   $('#edUnSub').textContent = !unmatched.length ? '' : d.unmatched === 'skip' ? 'No rule matches these rows. They will be skipped on import.'
-    : `No rule matches these rows. They will be imported with the vendor taken from “${d.mapping.vendor || d.mapping.description || '—'}”. Select text in a cell, then click + Rule.`;
+    : `No rule matches these rows. They will be imported with the vendor taken from “${d.mapping.vendor || d.mapping.description || '—'}”. Select text in a cell, then click + Rule, or click Pass to import every row with that description and category as it is.`;
   const LIM = 200;
   $('#edUnmatchedTbl').innerHTML = !unmatched.length
     ? `<div class="empty" style="padding:26px">${recs.length ? `<h3>Every row matched a vendor rule</h3><p>Nothing left to handle in this file.</p>` : '<p>No rows.</p>'}</div>`
     : `<div class="table-wrap" style="max-height:380px"><table class="data compact"><thead><tr><th class="rownum">#</th><th></th>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>
-      ${unmatched.slice(0, LIM).map(r => `<tr data-row="${r.row}"><td class="rownum">${r.row}</td><td class="act" style="text-align:left"><span class="row nowrap" style="gap:4px"><button class="btn sm" data-addrule="${r.row}" title="Create a vendor rule from this row">${icon('plus')}Rule</button><button class="btn sm ghost" data-addskip="${r.row}" title="Create a skip rule from this row">Skip</button></span></td>
+      ${unmatched.slice(0, LIM).map(r => `<tr data-row="${r.row}"><td class="rownum">${r.row}</td><td class="act" style="text-align:left"><span class="row nowrap" style="gap:4px"><button class="btn sm" data-addrule="${r.row}" title="Create a vendor rule from this row">${icon('plus')}Rule</button><button class="btn sm ghost" data-addpass="${r.row}" title="Import every row with this description and category as it is">Pass</button><button class="btn sm ghost" data-addskip="${r.row}" title="Create a skip rule from this row">Skip</button></span></td>
         ${cols.map(c => `<td class="ellipsis" data-col="${esc(c)}" title="${esc(r.raw[c])}">${esc(r.raw[c])}</td>`).join('')}</tr>`).join('')}
       </tbody></table></div>${unmatched.length > LIM ? `<div class="pager">Showing first ${LIM} of ${unmatched.length} unmatched rows</div>` : ''}`;
-  // Matched: standardized output
+  // Matched: standardized output. Rows caught by the rule being edited come first, so they show up even when the
+  // table is cut off at LIM rows.
   $('#edMaTitle').innerHTML = `Matched rows <span class="badge ${matched.length ? 'green' : ''}">${matched.length}</span>`;
+  const activeRule = d.vendorRules.indexOf(ed.active), activePass = d.passRules.indexOf(ed.active);
+  const isActive = r => (activeRule >= 0 && r.rule === activeRule) || (activePass >= 0 && r.pass === activePass);
+  const mine = matched.filter(isActive);
+  if (mine.length) matched = [...mine, ...matched.filter(r => !isActive(r))];
+  $('#edMaSub').textContent = 'Formatted exactly as they will be imported' + (mine.length ? ` · ${mine.length === 1 ? 'the row' : `the ${mine.length} rows`} from ${activeRule >= 0 ? `vendor rule #${activeRule + 1}` : `pass rule #${activePass + 1}`} ${mine.length === 1 ? 'is' : 'are'} listed first` : '');
   const issues = matched.some(r => r.errors.length);
   $('#edMatchedTbl').innerHTML = !matched.length
     ? `<div class="empty" style="padding:26px"><p>${d.vendorRules.some(ruleReady) ? 'Your rules don’t match any rows in this file yet.' : 'Rows appear here, formatted, once a vendor rule matches them.'}</p></div>`
     : `<div class="table-wrap" style="max-height:420px"><table class="data compact"><thead><tr><th class="rownum">#</th><th>Date</th><th>Vendor</th><th>Vendor ID</th><th>Description</th><th>Category</th><th class="amt">Amount</th><th>Rule</th>${issues ? '<th>Issues</th>' : ''}<th></th></tr></thead><tbody>
-      ${matched.slice(0, LIM).map(r => `<tr class="${r.errors.length ? 'bad' : ''}"><td class="rownum">${r.row}</td><td class="nowrap">${r.date ? fmtDate(r.date) : '<span class="neg">—</span>'}</td><td class="ellipsis"><b style="font-weight:550">${esc(r.vendor)}</b></td><td class="mono muted">${esc(r.vendorId)}</td><td class="ellipsis muted desc" title="${esc(r.description)}">${esc(r.description)}</td>
+      ${matched.slice(0, LIM).map(r => `<tr class="${r.errors.length ? 'bad' : ''} ${isActive(r) ? 'hl' : ''}"><td class="rownum">${r.row}</td><td class="nowrap">${r.date ? fmtDate(r.date) : '<span class="neg">—</span>'}</td><td class="ellipsis"><b style="font-weight:550">${esc(r.vendor)}</b></td><td class="mono muted">${esc(r.vendorId)}</td><td class="ellipsis muted desc" title="${esc(r.description)}">${esc(r.description)}</td>
         <td>${esc(r.amount != null ? catOf({ ...r, category: '', rawCategory: r.category, ruleCategory: r.ruleCategory, id: null }) : '')}</td><td class="amt ${r.amount > 0 ? 'pos' : ''}">${r.amount == null ? '<span class="neg">—</span>' : money(r.amount, { sign: true })}</td>
-        <td><span class="badge blue">#${r.rule + 1}</span></td>${issues ? `<td class="neg" style="font-size:12px">${esc(r.errors.join('; '))}</td>` : ''}<td class="act"><button class="btn sm ghost" data-skipvendor="${r.row}" title="Skip every row with this vendor">Skip</button></td></tr>`).join('')}
+        <td>${r.rule >= 0 ? `<span class="badge blue">#${r.rule + 1}</span>` : `<span class="badge green" title="Pass rule ${r.pass + 1}">Pass #${r.pass + 1}</span>`}</td>${issues ? `<td class="neg" style="font-size:12px">${esc(r.errors.join('; '))}</td>` : ''}<td class="act"><button class="btn sm ghost" data-skipvendor="${r.row}" title="Skip every row with this vendor">Skip</button></td></tr>`).join('')}
       </tbody></table></div>${matched.length > LIM ? `<div class="pager">Showing first ${LIM} of ${matched.length} matched rows</div>` : ''}`;
   // Skipped by a skip rule
   $('#edSkTitle').innerHTML = `Skipped rows <span class="badge ${skippedRows.length ? 'red' : ''}">${skippedRows.length}</span>`;
@@ -3962,7 +4025,7 @@ function bindEditor(root) {
   const ed = S.ui.editor, d = ed.draft;
   const full = () => renderEditor(root);
   const strip = o => { const c = clone(o); delete c._new; delete c._guessed; return JSON.stringify(c); };
-  const dirty = () => d._new ? (d.vendorRules.length > 0 || d.skipRules.length > 0 || !!d.name) : strip(d) !== strip(JSON.parse(ed.original));
+  const dirty = () => d._new ? (d.vendorRules.length > 0 || d.passRules.length > 0 || d.skipRules.length > 0 || !!d.name) : strip(d) !== strip(JSON.parse(ed.original));
   const leave = async () => { if (dirty() && !await confirmDialog('Discard changes?', 'You have unsaved changes to this template.', { ok: 'Discard', danger: true })) return; S.ui.editor = null; S.ui.imported.tab = 'templates'; render(); };
   $('#edBack').onclick = leave; $('#edCancel').onclick = leave;
   const del = $('#edDelete'); if (del) del.onclick = async () => {
@@ -3978,6 +4041,8 @@ function bindEditor(root) {
     if (missing.length && !await confirmDialog('Mapping incomplete', `No column is mapped to ${missing.join(' and ')}. Every row will be rejected on import until you map it. Save anyway?`, { ok: 'Save anyway' })) return;
     const clean = clone(d); delete clean._new; delete clean._guessed;
     clean.vendorRules = clean.vendorRules.filter(r => r.column || r.value || r.vendor);
+    clean.passRules = (clean.passRules || []).filter(r => String(r.description ?? '').trim());
+    if (!clean.passRules.length) delete clean.passRules;   // older templates have none: keeps tplSig, so Refresh doesn't re-read their files
     clean.skipRules = (clean.skipRules || []).filter(r => String(r.value ?? '').trim());
     clean.parent = String(clean.parent || '').trim();
     const i = S.db.templates.findIndex(t => t.id === d.id);
@@ -4003,10 +4068,58 @@ function bindEditor(root) {
   $('#edSkipZero').onchange = e => { d.skipZero = e.target.checked; editorLiveUpdate(); };
   $$('[data-map]', root).forEach(sel => sel.onchange = () => { d.mapping[sel.dataset.map] = sel.value; editorLiveUpdate(); });
 
+  // ---- rule lists ----
+  // Rows are added, moved, toggled and removed in place: redrawing the whole editor is slow once there are 100+ rules.
+  const cols = ed.raw?.columns || [];
+  const LISTS = {
+    rule: { box: $('#edRules'), attr: 'rule', arr: () => d.vendorRules, html: (r, i) => ruleRow(r, i, cols) },
+    pass: { box: $('#edPassRules'), attr: 'pass', arr: () => d.passRules, html: passRow },
+    skip: { box: $('#edSkipRules'), attr: 'skip', arr: () => d.skipRules, html: (r, i) => skipRow(r, i, cols) },
+  };
+  const refresh = () => { editorRun(); drawEditorTables(); };
+  /** Renumber a list's rows after a change, and show its hint again once it is empty. */
+  const renumber = key => {
+    const L = LISTS[key], rows = $$(`[data-${L.attr}]`, L.box);
+    rows.forEach((el, i) => {
+      el.dataset[L.attr] = i; $('.step-num', el).textContent = i + 1;
+      const up = $('[data-ract="up"], [data-sact="up"]', el), down = $('[data-ract="down"], [data-sact="down"]', el);
+      if (up) up.disabled = i === 0;
+      if (down) down.disabled = i === rows.length - 1;
+    });
+    if (!rows.length) L.box.innerHTML = RULES_EMPTY[key];
+  };
+  const addRow = (key, r) => {
+    const L = LISTS[key], R = L.arr();
+    R.push(r);
+    if (!$(`[data-${L.attr}]`, L.box)) L.box.innerHTML = '';   // drop the empty-list hint
+    L.box.insertAdjacentHTML('beforeend', L.html(r, R.length - 1));
+    if (key !== 'skip') ed.active = r;
+    renumber(key); refresh();
+  };
+  const rowAction = (key, el, b) => {
+    const L = LISTS[key], R = L.arr(), i = +el.dataset[L.attr], r = R[i], act = b.dataset.ract || b.dataset.pact || b.dataset.sact;
+    if (act === 'up' && i > 0) { [R[i - 1], R[i]] = [R[i], R[i - 1]]; el.previousElementSibling.before(el); b.focus(); }
+    if (act === 'down' && i < R.length - 1) { [R[i + 1], R[i]] = [R[i], R[i + 1]]; el.nextElementSibling.after(el); b.focus(); }
+    if (act === 'toggle') {
+      r.enabled = r.enabled === false;
+      const off = r.enabled === false;
+      el.classList.toggle('off', off); b.title = off ? 'Enable' : 'Disable'; b.innerHTML = icon(off ? 'eyeoff' : 'eye');
+    }
+    if (act === 'del') { R.splice(i, 1); el.remove(); }
+    else if (key !== 'skip') ed.active = r;
+    renumber(key); refresh();
+  };
+  // The Matched table lists the rows of the vendor or pass rule being worked on first.
+  for (const key of ['rule', 'pass']) LISTS[key].box.addEventListener('focusin', e => {
+    const L = LISTS[key], el = e.target.closest(`[data-${L.attr}]`); if (!el || e.target.closest('.vr-tools')) return;   // tool buttons: rowAction handles it
+    const r = L.arr()[+el.dataset[L.attr]];
+    if (r && r !== ed.active) { ed.active = r; drawEditorTables(); }
+  });
+
   // ---- vendor rules ----
   const focusRule = (i, field) => { const el = $(`#edRules .vrule[data-rule="${i}"] [data-rf="${field}"]`); if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.focus(); el.select && el.select(); } };
   const lastCol = () => [...d.vendorRules].reverse().find(r => r.column)?.column || d.mapping.description || ed.raw?.columns[0] || '';
-  $('#edAddRule').onclick = () => { d.vendorRules.push({ id: uid(), column: lastCol(), op: 'contains', value: '', vendor: '', enabled: true }); full(); focusRule(d.vendorRules.length - 1, 'value'); };
+  $('#edAddRule').onclick = () => { addRow('rule', { id: uid(), column: lastCol(), op: 'contains', value: '', vendor: '', enabled: true }); focusRule(d.vendorRules.length - 1, 'value'); };
   const rules = $('#edRules');
   rules.addEventListener('input', e => {
     const el = e.target.closest('[data-rf]'); if (!el || el.tagName !== 'INPUT') return;
@@ -4017,17 +4130,20 @@ function bindEditor(root) {
     d.vendorRules[+el.closest('.vrule').dataset.rule][el.dataset.rf] = el.value; editorLiveUpdate();
   });
   rules.addEventListener('click', e => {
-    const b = e.target.closest('[data-ract]'); if (!b) return;
-    const i = +b.closest('.vrule').dataset.rule, R = d.vendorRules;
-    if (b.dataset.ract === 'up' && i > 0) [R[i - 1], R[i]] = [R[i], R[i - 1]];
-    if (b.dataset.ract === 'down' && i < R.length - 1) [R[i + 1], R[i]] = [R[i], R[i + 1]];
-    if (b.dataset.ract === 'toggle') R[i].enabled = R[i].enabled === false;
-    if (b.dataset.ract === 'del') R.splice(i, 1);
-    full();
+    const b = e.target.closest('[data-ract]'); if (b) rowAction('rule', b.closest('.vrule'), b);
+  });
+  // ---- pass rules ----
+  const passes = $('#edPassRules');
+  passes.addEventListener('input', e => {
+    const el = e.target.closest('[data-pf]'); if (!el) return;
+    d.passRules[+el.closest('.prule').dataset.pass][el.dataset.pf] = el.value; editorLiveUpdate();
+  });
+  passes.addEventListener('click', e => {
+    const b = e.target.closest('[data-pact]'); if (b) rowAction('pass', b.closest('.prule'), b);
   });
   // ---- skip rules ----
   const focusSkip = i => { const el = $(`#edSkipRules .srule[data-skip="${i}"] [data-sf="value"]`); if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.focus(); el.select(); } };
-  const addSkip = r => { d.skipRules.push(Object.assign({ id: uid(), column: lastCol(), op: 'contains', value: '', enabled: true }, r)); full(); focusSkip(d.skipRules.length - 1); };
+  const addSkip = r => { addRow('skip', Object.assign({ id: uid(), column: lastCol(), op: 'contains', value: '', enabled: true }, r)); focusSkip(d.skipRules.length - 1); };
   $('#edAddSkip').onclick = () => addSkip({});
   const skips = $('#edSkipRules');
   skips.addEventListener('input', e => {
@@ -4039,13 +4155,7 @@ function bindEditor(root) {
     d.skipRules[+el.closest('.srule').dataset.skip][el.dataset.sf] = el.value; editorLiveUpdate();
   });
   skips.addEventListener('click', e => {
-    const b = e.target.closest('[data-sact]'); if (!b) return;
-    const i = +b.closest('.srule').dataset.skip, R = d.skipRules;
-    if (b.dataset.sact === 'up' && i > 0) [R[i - 1], R[i]] = [R[i], R[i - 1]];
-    if (b.dataset.sact === 'down' && i < R.length - 1) [R[i + 1], R[i]] = [R[i], R[i + 1]];
-    if (b.dataset.sact === 'toggle') R[i].enabled = R[i].enabled === false;
-    if (b.dataset.sact === 'del') R.splice(i, 1);
-    full();
+    const b = e.target.closest('[data-sact]'); if (b) rowAction('skip', b.closest('.srule'), b);
   });
   $('#edMatchedTbl').addEventListener('click', e => {
     const b = e.target.closest('[data-skipvendor]'); if (!b) return;
@@ -4057,7 +4167,7 @@ function bindEditor(root) {
   let picked = null;
   const unTbl = $('#edUnmatchedTbl');
   unTbl.addEventListener('mousedown', e => {
-    const b = e.target.closest('[data-addrule], [data-addskip]'); if (!b) return;
+    const b = e.target.closest('[data-addrule], [data-addskip], [data-addpass]'); if (!b) return;
     e.preventDefault(); // keep the text selection alive
     const sel = window.getSelection(), text = sel ? sel.toString().trim() : '';
     const cell = text && sel.anchorNode ? sel.anchorNode.parentElement?.closest('td[data-col]') : null;
@@ -4069,9 +4179,20 @@ function bindEditor(root) {
     const col = picked?.col || lastCol();
     const value = picked?.text || String(rec.raw[col] ?? '').trim();
     const vendor = picked ? picked.text.toLowerCase().replace(/(^|[\s\-/&(.'])([a-z])/g, (m, a, c) => a + c.toUpperCase()) : '';
-    d.vendorRules.push({ id: uid(), column: col, op: 'contains', value, vendor, enabled: true });
     window.getSelection()?.removeAllRanges(); picked = null;
-    full(); focusRule(d.vendorRules.length - 1, vendor ? 'vendor' : 'value');
+    addRow('rule', { id: uid(), column: col, op: 'contains', value, vendor, enabled: true });
+    focusRule(d.vendorRules.length - 1, vendor ? 'vendor' : 'value');
+  });
+  unTbl.addEventListener('click', e => {
+    const b = e.target.closest('[data-addpass]'); if (!b) return;
+    const rec = ed.recs.find(r => r.row === +b.dataset.addpass); if (!rec) return;
+    if (!d.mapping.description) return toast('Map a Description column first', 'err');
+    if (!rec.description) return toast('This row has no description to match', 'err');
+    // Text highlighted in the Description or Category cell narrows that part of the match.
+    const part = col => picked?.col === d.mapping[col] ? picked.text : rec[col];
+    const rule = { id: uid(), description: part('description'), category: part('category'), enabled: true };
+    window.getSelection()?.removeAllRanges(); picked = null;
+    addRow('pass', rule);
   });
   unTbl.addEventListener('click', e => {
     const b = e.target.closest('[data-addskip]'); if (!b) return;
