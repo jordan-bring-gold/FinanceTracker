@@ -30,7 +30,7 @@ statement files, budget, rules, goals and settings are all saved there, with aut
 
 ```
 Finances/                       ← the folder you pick
-├── Statements/
+├── Statements/                 ← created for you when you add your first bank or card
 │   ├── checking/               ← one folder per bank or card, holding its CSV exports
 │   └── credit_card/
 ├── finance-tracker.json        ← everything else: transactions, budget, rules, goals, settings

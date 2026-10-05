@@ -975,8 +975,10 @@ function normalizeDb(db) {
 /* ---------- data folder access ----------
    Everything lives in the data folder you pick. The page reads and writes it directly through the File System Access
    API (Chrome and Edge). The only thing the browser keeps is that folder's handle, in IndexedDB, so the next visit can
-   ask for permission to open the same folder again: no transactions, settings or preferences. Paths are relative to
-   the data folder and "/"-separated, e.g. "Statements/chase/2026-09.csv". */
+   ask for permission to open the same folder again: no transactions, settings or preferences.
+   The database and its backups sit in the data folder itself. Statement files live in its "Statements" folder (any
+   capitalisation; created the first time a folder is added), one folder per bank or account. Statement paths are
+   relative to Statements and "/"-separated, e.g. "chase/2026-09.csv" for Statements/chase/2026-09.csv. */
 const DB_FILE = 'finance-tracker.json', BACKUP_DIR = '.finance-tracker-backups', BACKUPS_TO_KEEP = 20;
 const DATA_EXTENSIONS = ['.csv', '.tsv', '.txt'];
 const isDataFile = name => DATA_EXTENSIONS.some(x => name.toLowerCase().endsWith(x));
@@ -1004,8 +1006,9 @@ function pathParts(rel) {
   if (parts.some(p => p === '.' || p === '..')) throw new FolderError('Path is outside the data folder', 403);
   return parts;
 }
+/** A folder inside Statements ("" for Statements itself). Throws NotFoundError if it doesn't exist, unless create. */
 async function dirAt(rel, create = false) {
-  let d = S.root;
+  let d = await S.root.getDirectoryHandle(stmtRoot(), { create });
   for (const p of pathParts(rel)) d = await d.getDirectoryHandle(p, { create });
   return d;
 }
@@ -1023,14 +1026,16 @@ function localIso(d = new Date()) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** Name of the data folder's "Statements" folder (any capitalisation), or "" if it has none. */
+/** Name of the data folder's "Statements" folder in whatever capitalisation it has, or "Statements" if there's none yet. */
 async function findStatementsRoot() {
   const names = [];
   for await (const [name, h] of S.root.entries()) if (h.kind === 'directory' && name.toLowerCase() === 'statements') names.push(name);
-  return names.sort()[0] || '';
+  return names.sort()[0] || 'Statements';
 }
-/** Every folder in the data folder (hidden ones skipped), with how many data files each holds directly. */
+/** Every folder in Statements (hidden ones skipped), with how many data files each holds directly. "" is Statements. */
 async function listFolders() {
+  let top;
+  try { top = await dirAt(''); } catch (e) { if (isMissing(e)) return []; throw e; }
   const out = [];
   const walk = async (dir, rel) => {
     let fileCount = 0; const subs = [];
@@ -1042,7 +1047,7 @@ async function listFolders() {
     subs.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
     for (const [name, h] of subs) await walk(h, rel ? `${rel}/${name}` : name);
   };
-  await walk(S.root, '');
+  await walk(top, '');
   return out;
 }
 /** The data files in one folder, newest first. */
@@ -1093,7 +1098,7 @@ async function sameBytes(a, b) {
 async function saveUpload(folder, file) {
   let dir = null;
   if (pathParts(folder).length) try { dir = await dirAt(folder); } catch (e) { if (!isMissing(e)) throw e; }
-  if (!dir) throw new FolderError(`Folder does not exist: ${folder || '(data folder)'}`, 400);
+  if (!dir) throw new FolderError(`Folder does not exist: ${folder || stmtRoot()}`, 400);
   const name = checkName(file.name, 'file');
   if (!isDataFile(name)) throw new FolderError(`Only ${DATA_EXTENSIONS.join(', ')} files can be imported: ${name}`, 400);
   let target = name, status = 'saved';
@@ -3484,7 +3489,7 @@ function renderTemplatesTab(body) {
         const files = Object.values(S.db.importedFiles).filter(f => f.templateId === t.id);
         const last = files.map(f => f.importedAt).sort().pop();
         const count = S.db.transactions.filter(x => x.templateId === t.id).length;
-        return `<tr><td><b style="font-weight:600">${esc(t.name)}</b>${t.parent ? ` <span class="badge" title="Parent group">${icon('flow', 'width="11" height="11"')}${esc(t.parent)}</span>` : ''}</td><td>${icon('folder', 'width="14" height="14" style="vertical-align:-2px;color:var(--muted)"')} <span class="mono" title="${esc(t.folder)}">${esc(showPath(t.folder) || '(data folder)')}</span></td>
+        return `<tr><td><b style="font-weight:600">${esc(t.name)}</b>${t.parent ? ` <span class="badge" title="Parent group">${icon('flow', 'width="11" height="11"')}${esc(t.parent)}</span>` : ''}</td><td>${icon('folder', 'width="14" height="14" style="vertical-align:-2px;color:var(--muted)"')} <span class="mono" title="${esc(t.folder)}">${esc(t.folder || '(data folder)')}</span></td>
         <td>${(t.vendorRules || []).length}</td><td data-sort-value="${count}">${count.toLocaleString()} rows · ${files.length} files</td><td class="muted" data-sort-value="${last ? new Date(last).getTime() : ''}">${last ? new Date(last).toLocaleString() : 'Never'}</td>
         <td>${t.enabled === false ? '<span class="badge">Paused</span>' : '<span class="badge green">Active</span>'}</td>
         <td class="act"><button class="btn sm" data-tedit="${t.id}">${icon('edit')}Edit</button> <button class="btn ghost icon sm" data-tcopy="${t.id}" title="Duplicate">${icon('copy')}</button><button class="btn ghost icon sm" data-ttoggle="${t.id}" title="${t.enabled === false ? 'Resume' : 'Pause'}">${icon(t.enabled === false ? 'eye' : 'eyeoff')}</button><button class="btn ghost icon sm danger" data-tdel="${t.id}" title="Delete">${icon('trash')}</button></td></tr>`;
@@ -3509,7 +3514,7 @@ function renderTemplatesTab(body) {
 
 /** Files tab: every file in the statement folders as a folder tree, with how each one was imported (if it was). */
 function renderFilesTab(body) {
-  body.innerHTML = `<div class="card"><div class="card-head"><div><div class="card-title">Files</div><div class="card-sub">Every file in ${stmtRoot() ? `your ${esc(stmtRoot())} folder` : 'your statement folders'}, and what happened when it was imported. Click a folder to open or close it. <b>Refresh</b> imports new and changed files.</div></div></div>
+  body.innerHTML = `<div class="card"><div class="card-head"><div><div class="card-title">Files</div><div class="card-sub">Every file in your ${esc(stmtRoot())} folder, and what happened when it was imported. Click a folder to open or close it. <b>Refresh</b> imports new and changed files.</div></div></div>
     <div class="card-body flush" id="filesTree"><div class="loading">Reading folders…</div></div></div>`;
   loadFileTree().then(data => { if ($('#filesTree') && body.isConnected) drawFileTree(data); })
     .catch(e => { const el = $('#filesTree'); if (el) el.innerHTML = `<div class="banner err" style="margin:16px">${icon('alert')}<div>${esc(e.message)}</div></div>`; });
@@ -3522,32 +3527,23 @@ async function loadFileTree() {
   return { folders, files: lists.flat() };
 }
 function drawFileTree({ folders, files }) {
-  const el = $('#filesTree'), root = stmtRoot(), collapsed = S.ui.filesCollapsed || (S.ui.filesCollapsed = new Set());
-  // Folder nodes, nested by path under the root; a folder outside the root hangs off the root under its full path.
+  const el = $('#filesTree'), collapsed = S.ui.filesCollapsed || (S.ui.filesCollapsed = new Set());
+  // Folder nodes, nested by path under Statements ("").
   const nodes = new Map();
+  const parentOf = path => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
   const node = path => {
     if (nodes.has(path)) return nodes.get(path);
-    const n = { path, name: showPath(path).split('/').pop(), folders: [], files: [] };
+    const n = { path, name: path.split('/').pop(), folders: [], files: [] };
     nodes.set(path, n);
-    if (path !== root) {
-      const up = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
-      const inside = !root || path.startsWith(root + '/');
-      const parent = node(inside ? up : root);
-      if (!inside) n.name = path;
-      parent.folders.push(n);
-    }
+    if (path) node(parentOf(path)).folders.push(n);
     return n;
   };
-  node(root);
+  node('');
   folders.forEach(f => node(f.path));
   const disk = new Map(files.map(f => [f.path, f]));
   const paths = new Set([...disk.keys(), ...Object.keys(S.db.importedFiles)]);
-  for (const path of paths) {
-    const folder = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
-    if (root && folder === '') continue;                     // a file sitting in the data folder itself
-    node(folder).files.push({ path, name: path.split('/').pop(), imp: S.db.importedFiles[path] });
-  }
-  const top = nodes.get(root);
+  for (const path of paths) node(parentOf(path)).files.push({ path, name: path.split('/').pop(), imp: S.db.importedFiles[path] });
+  const top = nodes.get('');
   if (!top.folders.length && !top.files.length) {
     el.innerHTML = `<div class="empty">${icon('folder')}<h3>No statement folders yet</h3><p>Click <b>Import</b> to add a folder and your first statement files.</p></div>`;
     return;
@@ -3660,16 +3656,11 @@ async function scanAndImport() {
   toast(`Refreshed: ${parts.join(', ')} · ${net >= 0 ? `${net.toLocaleString()} new transaction${net === 1 ? '' : 's'}` : `${(-net).toLocaleString()} fewer transactions`}${invalid ? ` · ${invalid} invalid rows skipped` : ''}`, 'ok');
 }
 
-/*
- * Statements root: when the data folder has a "Statements" folder (checked when the folder opens), each bank or
- * account gets a folder inside it, and paths are shown relative to it ("chase" rather than "Statements/chase").
- * Paths are still stored relative to the data folder, so templates keep working if the folder is added or removed.
- */
-const stmtRoot = () => S.config?.statementsRoot || '';
-/** A statement folder inside the root (or any folder but the data folder itself, with no root). */
-const isStmtFolder = path => !!path && (!stmtRoot() || path.startsWith(stmtRoot() + '/'));
-/** How a folder or file path is shown: relative to the Statements root when it's inside it. */
-const showPath = path => stmtRoot() && String(path || '').startsWith(stmtRoot() + '/') ? path.slice(stmtRoot().length + 1) : path;
+/* Each bank or account gets a folder in the data folder's Statements folder, and statement paths are relative to it:
+   "chase" is Statements/chase (see "data folder access"). */
+const stmtRoot = () => S.config?.statementsRoot || 'Statements';
+/** A bank or account folder: any folder in Statements, but not Statements itself. */
+const isStmtFolder = path => !!path;
 
 /**
  * Import button: pick a folder of the data folder (or create one), then pick files on this computer; they are copied
@@ -3688,9 +3679,9 @@ async function importFilesDialog() {
   const choose = path => { target = path; picker.value = ''; picker.click(); };
   const draw = () => {
     $('.modal-body', m.el).innerHTML = `<p class="hint" style="margin:0 0 12px">Select a folder you want to add data to</p>
-      ${folders.length ? `<div class="imp-folders">${folders.map((f, i) => { const t = tplsFor(f.path); return `<button class="imp-folder" data-fi="${i}">${icon('folder')}<span class="imp-folder-name" title="${esc(f.path)}">${esc(showPath(f.path))}</span>
+      ${folders.length ? `<div class="imp-folders">${folders.map((f, i) => { const t = tplsFor(f.path); return `<button class="imp-folder" data-fi="${i}">${icon('folder')}<span class="imp-folder-name" title="${esc(f.path)}">${esc(f.path)}</span>
         <span class="muted nowrap">${f.fileCount} file${f.fileCount === 1 ? '' : 's'}</span>${t.length ? t.map(x => `<span class="badge blue">${esc(x.name)}</span>`).join('') : '<span class="badge" title="No import template reads this folder yet">No template</span>'}</button>`; }).join('')}</div>`
-        : `<div class="empty" style="padding:16px"><p>${stmtRoot() ? `Your ${esc(stmtRoot())} folder` : 'Your data folder'} has no folders yet. Add one to put the files in.</p></div>`}
+        : `<div class="empty" style="padding:16px"><p>Your ${esc(stmtRoot())} folder has no folders yet. Add one to put the files in.</p></div>`}
       ${adding ? `<form class="row nowrap" id="newFolderForm" style="margin-top:12px"><input class="input" id="newFolderName" placeholder="New folder name, e.g. Amex" style="flex:1" autocomplete="off">
           <button class="btn primary" type="submit">Create &amp; pick files</button>${folders.length ? '<button class="btn ghost" type="button" id="newFolderCancel">Cancel</button>' : ''}</form>`
         : `<button class="btn" id="newFolderBtn" style="margin-top:12px">${icon('plus')}Add another folder</button>`}`;
@@ -3702,9 +3693,9 @@ async function importFilesDialog() {
       e.preventDefault();
       const name = $('#newFolderName', m.el).value.trim(); if (!name) return;
       try {
-        const { path } = await makeFolder(stmtRoot() ? `${stmtRoot()}/${name}` : name);
+        const { path } = await makeFolder(name);
         if (!folders.some(f => f.path === path)) folders.push({ path, fileCount: 0 });
-        folders.sort((a, b) => showPath(a.path).localeCompare(showPath(b.path))); adding = false; draw();
+        folders.sort((a, b) => a.path.localeCompare(b.path)); adding = false; draw();
         choose(path);
       } catch (err) { toast(err.message, 'err'); }
     };
@@ -3713,7 +3704,7 @@ async function importFilesDialog() {
   if (adding) $('#newFolderName', m.el).focus();
   picker.onchange = async () => {
     const files = [...picker.files]; if (!files.length) return;
-    $('.modal-body', m.el).innerHTML = `<div class="loading">Copying ${files.length} file${files.length === 1 ? '' : 's'} to ${esc(showPath(target))}…</div>`;
+    $('.modal-body', m.el).innerHTML = `<div class="loading">Copying ${files.length} file${files.length === 1 ? '' : 's'} to ${esc(target)}…</div>`;
     const res = [];
     for (const f of files) {
       try { res.push(await saveUpload(target, f)); }
@@ -3722,12 +3713,12 @@ async function importFilesDialog() {
     m.close();
     const count = st => res.filter(r => r.status === st).length, failed = res.filter(r => r.error);
     const copied = count('saved') + count('renamed');
-    if (copied || count('unchanged')) toast(`Copied ${copied} file${copied === 1 ? '' : 's'} to ${showPath(target)}`
+    if (copied || count('unchanged')) toast(`Copied ${copied} file${copied === 1 ? '' : 's'} to ${target}`
       + (count('renamed') ? ` · ${count('renamed')} renamed so nothing was overwritten` : '') + (count('unchanged') ? ` · ${count('unchanged')} already there` : ''), 'ok');
     failed.forEach(r => toast(`${r.name}: ${r.error}`, 'err'));
     if (!copied && !count('unchanged')) return;
     if (tplsFor(target).some(t => t.enabled !== false)) return scanAndImport();
-    if (await confirmDialog('Create an import template?', `No import template reads ${showPath(target)} yet, so its files can't be imported. Create one now? It shows the newest file as a preview while you map its columns.`, { ok: 'Create template', cancel: 'Later' })) openEditor(null, target);
+    if (await confirmDialog('Create an import template?', `No import template reads ${target} yet, so its files can't be imported. Create one now? It shows the newest file as a preview while you map its columns.`, { ok: 'Create template', cancel: 'Later' })) openEditor(null, target);
   };
 }
 
@@ -3815,8 +3806,8 @@ async function renderEditor(root) {
         <div class="field wide"><label>Template name</label><input class="input" id="edName" value="${esc(d.name)}" placeholder="e.g. Chase Checking"></div>
         <div class="field wide"><label title="Everything this template imports is grouped under this name in the cash-flow diagram">Parent group <span class="muted">(optional)</span></label><input class="input" id="edParent" list="parentList" value="${esc(d.parent || '')}" placeholder="e.g. Credit Card">${parentDatalist()}</div>
         <div class="field wide"><label>Folder</label><select class="select" id="edFolder">
-          ${ed.folders.filter(f => isStmtFolder(f.path) || f.path === d.folder).map(f => `<option value="${esc(f.path)}" ${f.path === d.folder ? 'selected' : ''}>${esc(showPath(f.path) || '(data folder root)')} · ${f.fileCount} file${f.fileCount === 1 ? '' : 's'}</option>`).join('')}
-          ${ed.folders.some(f => f.path === d.folder) ? '' : `<option selected value="${esc(d.folder)}">${esc(showPath(d.folder))} (missing)</option>`}</select></div>
+          ${ed.folders.filter(f => isStmtFolder(f.path) || f.path === d.folder).map(f => `<option value="${esc(f.path)}" ${f.path === d.folder ? 'selected' : ''}>${esc(f.path || `${stmtRoot()} (top level)`)} · ${f.fileCount} file${f.fileCount === 1 ? '' : 's'}</option>`).join('')}
+          ${ed.folders.some(f => f.path === d.folder) ? '' : `<option selected value="${esc(d.folder)}">${esc(d.folder)} (missing)</option>`}</select></div>
         <div class="field wide"><label>Preview file</label><select class="select" id="edFile">${ed.files.length ? ed.files.map((f, i) => `<option value="${esc(f.path)}" ${f.path === ed.file ? 'selected' : ''}>${esc(f.name)}${i === 0 ? '  (most recent)' : ''}</option>`).join('') : '<option value="">No CSV files in this folder</option>'}</select></div>
         <div class="field"><label>Delimiter</label><select class="select" id="edDelim">${[['auto', `Auto${ed.raw ? ` (${{ ',': 'comma', ';': 'semicolon', '\t': 'tab', '|': 'pipe' }[ed.raw.delimiter]})` : ''}`], [',', 'Comma'], [';', 'Semicolon'], ['tab', 'Tab'], ['|', 'Pipe']].map(([v, l]) => `<option value="${v}" ${d.parse.delimiter === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="field"><label>Skip top lines</label><input class="input" type="number" min="0" id="edSkip" value="${d.parse.skipRows || 0}"></div>
@@ -4131,11 +4122,11 @@ async function renderSettings(root) {
   const counts = new Map(); S.db.transactions.forEach(t => { const c = catOf(t); counts.set(c, (counts.get(c) || 0) + 1); });
   root.innerHTML = `
     <div class="grid grid-2">
-      <div class="card"><div class="card-head"><div><div class="card-title">Data folder</div><div class="card-sub">Where your bank CSV folders live. The app saves its database here too.</div></div></div>
+      <div class="card"><div class="card-head"><div><div class="card-title">Data folder</div><div class="card-sub">Where the app keeps everything: its database, backups and your statements.</div></div></div>
         <div class="card-body stack">
           <div class="row nowrap"><input class="input mono" id="setFolder" style="flex:1;cursor:pointer" value="${esc(S.config?.name || '')}" readonly title="Click to choose a different folder"><button class="btn primary" id="setFolderPick">${icon('folder')}Choose…</button></div>
-          <div class="hint">The folder that holds one subfolder per bank or account. Each subfolder can have its own import template. Browsers only show a folder's name, not where it is on your computer.</div>
-          <div><div class="section-title" style="margin:6px 0 4px">${stmtRoot() ? `Statement folders (in ${esc(stmtRoot())})` : 'Subfolders found'}</div><div id="setFolders" class="hint">Loading…</div></div>
+          <div class="hint">Statements go in its ${esc(stmtRoot())} folder, one folder per bank or account, each with its own import template. Browsers only show a folder's name, not where it is on your computer.</div>
+          <div><div class="section-title" style="margin:6px 0 4px">Statement folders (in ${esc(stmtRoot())})</div><div id="setFolders" class="hint">Loading…</div></div>
           <div class="hint">Database file: <span class="mono">${esc(DB_FILE)}</span> in this folder${S.db.savedAt ? ` · last saved ${new Date(S.db.savedAt).toLocaleString()}` : ''}. Backups are kept in <span class="mono">.finance-tracker-backups</span>.</div>
         </div></div>
       <div class="card"><div class="card-head"><div class="card-title">Preferences</div></div>
@@ -4155,7 +4146,7 @@ async function renderSettings(root) {
   listFolders().then(fs => {
     const el = $('#setFolders'); if (!el) return;
     const sub = fs.filter(f => isStmtFolder(f.path));
-    el.innerHTML = sub.length ? sub.map(f => { const t = S.db.templates.find(x => x.folder === f.path); return `<div class="list-row">${icon('folder', 'width="15" height="15" style="color:var(--muted)"')}<span class="mono" style="color:var(--text)" title="${esc(f.path)}">${esc(showPath(f.path))}</span><span class="muted">${f.fileCount} file${f.fileCount === 1 ? '' : 's'}</span><span class="spacer"></span>${t ? `<span class="badge green">${esc(t.name)}</span>` : `<button class="btn sm" data-newtpl="${esc(f.path)}">${icon('plus')}Template</button>`}</div>`; }).join('') : 'No subfolders yet. Create one per bank or account.';
+    el.innerHTML = sub.length ? sub.map(f => { const t = S.db.templates.find(x => x.folder === f.path); return `<div class="list-row">${icon('folder', 'width="15" height="15" style="color:var(--muted)"')}<span class="mono" style="color:var(--text)" title="${esc(f.path)}">${esc(f.path)}</span><span class="muted">${f.fileCount} file${f.fileCount === 1 ? '' : 's'}</span><span class="spacer"></span>${t ? `<span class="badge green">${esc(t.name)}</span>` : `<button class="btn sm" data-newtpl="${esc(f.path)}">${icon('plus')}Template</button>`}</div>`; }).join('') : 'No subfolders yet. Create one per bank or account.';
     $$('[data-newtpl]', el).forEach(b => b.onclick = () => openEditor(null, b.dataset.newtpl));
   }).catch(e => { const el = $('#setFolders'); if (el) el.textContent = e.message; });
 
@@ -4332,7 +4323,7 @@ function showFolderGate(handle, error = '', { blocked = false } = {}) {
   showGate(`${icon('folder')}
     <h3>${handle ? 'Open your data folder' : 'Choose your data folder'}</h3>
     <p>${handle ? `Finance Tracker needs your permission to read and save files in <b class="mono">${esc(handle.name)}</b>, the folder you picked last time.`
-      : 'Pick the folder where your bank statements and the Finance Tracker database live, or an empty folder to start a new one.'}
+      : 'Pick a folder for Finance Tracker: an empty one to start fresh, or the one holding your <span class="mono">finance-tracker.json</span>. It keeps your statements in a <span class="mono">Statements</span> folder inside it.'}
       Everything stays in that folder on this computer; the browser only remembers which folder it was.</p>
     ${error ? `<div class="banner err" style="text-align:left">${icon('alert')}<div>${esc(error)}${blocked ? ' <a href="#" id="gateHelp">How to allow file access</a>' : ''}</div></div>` : ''}
     <div class="row" style="justify-content:center;gap:8px">${handle ? `<button class="btn primary" id="gateOpen">${icon('folder')}Open ${esc(handle.name)}</button><button class="btn" id="gatePick">Choose a different folder</button>`
